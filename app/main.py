@@ -13,6 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from . import database as db
 from . import pipeline as pl
 from . import regions as regions_mod
+from . import releases
+from .release_api import router as release_router
 from .config import (
     DB_PATH,
     JOB_DIR,
@@ -26,6 +28,7 @@ from .profiles import ProfileError
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state = init_state()
+    releases.ensure_dirs()
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     for rec in state.pm.list_profiles():
@@ -36,7 +39,8 @@ async def lifespan(app: FastAPI):
     conn.close()
 
 
-app = FastAPI(title="印前色彩软打样台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="印前色彩软打样台", version="1.1.0", lifespan=lifespan)
+app.include_router(release_router)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 

@@ -15,6 +15,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SPD_DATA_DIR", BASE_DIR.parent / "data"))
 PROFILE_DIR = DATA_DIR / "profiles"
 JOB_DIR = DATA_DIR / "jobs"
+# 印刷配置版本发布与回归门禁模块的不可变存储（草稿快照、基线夹具、门禁产物）。
+RELEASE_DIR = DATA_DIR / "release"
 DB_PATH = DATA_DIR / "softproof.db"
 
 MAX_DIMENSION = int(os.environ.get("SPD_MAX_DIMENSION", "3000"))

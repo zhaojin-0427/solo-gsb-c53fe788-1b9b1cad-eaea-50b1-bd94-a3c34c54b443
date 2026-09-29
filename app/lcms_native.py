@@ -427,15 +427,21 @@ def _lab_to_xyz(lab: np.ndarray) -> np.ndarray:
     return np.stack([finv(fx) * Xn, finv(fy) * Yn, finv(fz) * Zn], axis=-1)
 
 
-def _a2b_table() -> np.ndarray:
-    """CMYK device -> Lab PCS, shape (n^4, 3), uint16 (ICC 16-bit Lab)."""
+def _a2b_table(ink_scale: float = 1.0) -> np.ndarray:
+    """CMYK device -> Lab PCS, shape (n^4, 3), uint16 (ICC 16-bit Lab).
+
+    ``ink_scale`` compresses the device gamut (<1 = weaker inks) so tests can
+    build a second, byte-distinct CMYK profile that actually moves output
+    colors. The default 1.0 reproduces the original demo profile exactly.
+    """
     n = _GRID_POINTS
     v = np.linspace(0.0, 1.0, n)
     c, m, y, k = np.meshgrid(v, v, v, v, indexing="ij")
     # Simple "physical" model: ink removes its primary, black removes all.
-    r = (1.0 - c) * (1.0 - k)
-    g = (1.0 - m) * (1.0 - k)
-    b = (1.0 - y) * (1.0 - k)
+    s = float(ink_scale)
+    r = (1.0 - c * s) * (1.0 - k * s)
+    g = (1.0 - m * s) * (1.0 - k * s)
+    b = (1.0 - y * s) * (1.0 - k * s)
     rgb_lin = _srgb_eotf(np.stack([r, g, b], axis=-1))
     xyz = rgb_lin @ _SRGB_TO_XYZ_D50.T
     lab = _xyz_to_lab(xyz)
@@ -544,12 +550,14 @@ def build_demo_gray_profile_bytes() -> bytes:
 
 def build_demo_cmyk_profile_bytes(
     description: str = "Soft Proofing Demo SWOP-like CMYK (synthetic, do not use for production)",
+    ink_scale: float = 1.0,
 ) -> bytes:
     """Build a self-contained, valid CMYK output profile (ICC v2.4).
 
     The gamut model is intentionally simple (complementary inks + sRGB
     chromaticities) -- it exists so the full pipeline runs out of the box;
-    users should upload real press profiles for production work.
+    users should upload real press profiles for production work. ``ink_scale``
+    allows generating a byte-distinct variant (used by regression tests).
     """
     L = lcms()
     prof = L.cmsCreateProfilePlaceholder(None)
@@ -575,7 +583,7 @@ def build_demo_cmyk_profile_bytes(
             raise RuntimeError("写入 wtpt 标签失败")
 
         for tag, table, n_in, n_out in (
-            (b"A2B0", _a2b_table(), 4, 3),
+            (b"A2B0", _a2b_table(ink_scale), 4, 3),
             (b"B2A0", _b2a_table(), 3, 4),
         ):
             pipe = L.cmsPipelineAlloc(None, n_in, n_out)

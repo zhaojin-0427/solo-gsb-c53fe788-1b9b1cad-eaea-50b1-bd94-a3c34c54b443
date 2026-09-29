@@ -45,6 +45,29 @@ class PipelineError(ValueError):
     pass
 
 
+def summary_from_bytes(data: bytes, profile_id: str = "<snapshot>") -> dict:
+    """Build the same profile summary dict as ProfileManager.summary from raw bytes.
+
+    Used by the regression gate, whose reruns bind to immutable snapshot bytes
+    rather than to files served from the live profile directories.
+    """
+    header = lcms_native.read_header(data)
+    try:
+        from PIL import ImageCms
+        import io as _io
+        name = ImageCms.getProfileName(
+            ImageCms.ImageCmsProfile(_io.BytesIO(data))
+        ).strip() or profile_id
+    except Exception:
+        name = profile_id
+    return {
+        "profile_id": profile_id,
+        "name": name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        **header,
+    }
+
+
 @dataclass
 class PipelineInputs:
     image_data: bytes
@@ -56,6 +79,11 @@ class PipelineInputs:
     threshold: float
     use_embedded: bool = False
     max_dimension: int = 3000
+    # 回归门禁重跑时按快照固定的 ICC 字节；提供后忽略按 ID 从可变目录取配置，
+    # 保证进行中/历史的重跑绑定的是固定快照而非当前文件。
+    source_profile_bytes: bytes | None = None
+    press_profile_bytes: bytes | None = None
+    display_profile_bytes: bytes | None = None
 
 
 def load_pixels(data: bytes, max_dimension: int) -> tuple[Image.Image, str, bytes | None]:
@@ -151,15 +179,40 @@ def run_pipeline(inputs: PipelineInputs, pm: ProfileManager) -> PipelineResult:
         embedded_sha = hashlib.sha256(embedded_icc).hexdigest()
         if src_cs not in ("RGB", "CMYK", "GRAY"):
             raise PipelineError(f"内嵌配置的色彩空间不支持: {src_cs}")
+    elif inputs.source_profile_bytes is not None:
+        src_bytes = inputs.source_profile_bytes
+        try:
+            src_header = lcms_native.read_header(src_bytes)
+        except Exception as exc:
+            raise PipelineError(f"源 ICC 配置无效: {exc}") from exc
+        pm.validate_for_role(src_header, "source")
+        src_cs = src_header["color_space"]
     else:
         pm.get(inputs.source_profile_id, "source")
         src_bytes, src_header = pm.get_bytes_header(inputs.source_profile_id)
         src_cs = src_header["color_space"]
 
-    pm.get(inputs.press_profile_id, "press")
-    pm.get(inputs.display_profile_id, "display")
-    press_bytes = pm.load_bytes(inputs.press_profile_id)
-    display_bytes = pm.load_bytes(inputs.display_profile_id)
+    if inputs.press_profile_bytes is not None:
+        press_bytes = inputs.press_profile_bytes
+        try:
+            press_header = lcms_native.read_header(press_bytes)
+        except Exception as exc:
+            raise PipelineError(f"印刷 ICC 配置无效: {exc}") from exc
+        pm.validate_for_role(press_header, "press")
+    else:
+        pm.get(inputs.press_profile_id, "press")
+        press_bytes = pm.load_bytes(inputs.press_profile_id)
+
+    if inputs.display_profile_bytes is not None:
+        display_bytes = inputs.display_profile_bytes
+        try:
+            display_header = lcms_native.read_header(display_bytes)
+        except Exception as exc:
+            raise PipelineError(f"显示 ICC 配置无效: {exc}") from exc
+        pm.validate_for_role(display_header, "display")
+    else:
+        pm.get(inputs.display_profile_id, "display")
+        display_bytes = pm.load_bytes(inputs.display_profile_id)
 
     # ---- strict channel/color-space matching ----------------------------
     pixel_mode = mode
@@ -241,10 +294,20 @@ def run_pipeline(inputs: PipelineInputs, pm: ProfileManager) -> PipelineResult:
             "sha256": embedded_sha,
             **embedded_header,
         }
+    elif inputs.source_profile_bytes is not None:
+        summaries["source"] = summary_from_bytes(src_bytes, inputs.source_profile_id)
     else:
         summaries["source"] = pm.summary(inputs.source_profile_id)
-    summaries["press"] = pm.summary(inputs.press_profile_id)
-    summaries["display"] = pm.summary(inputs.display_profile_id)
+    summaries["press"] = (
+        summary_from_bytes(press_bytes, inputs.press_profile_id)
+        if inputs.press_profile_bytes is not None
+        else pm.summary(inputs.press_profile_id)
+    )
+    summaries["display"] = (
+        summary_from_bytes(display_bytes, inputs.display_profile_id)
+        if inputs.display_profile_bytes is not None
+        else pm.summary(inputs.display_profile_id)
+    )
 
     return PipelineResult(
         inputs=inputs, image_sha=image_sha, img=img, mode=mode,

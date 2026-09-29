@@ -9,6 +9,21 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+// ---- 顶部导航：软打样 / 发布门禁 -----------------------------------------
+document.querySelectorAll(".navbtn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".navbtn").forEach((b) =>
+      b.classList.toggle("active", b === btn)
+    );
+    const v = btn.dataset.view;
+    $("view-softproof").hidden = v !== "softproof";
+    $("view-release").hidden = v !== "release";
+    if (v === "release" && typeof refreshReleaseView === "function") {
+      refreshReleaseView();
+    }
+  });
+});
+
 async function api(path, options) {
   const res = await fetch(path, options);
   if (!res.ok) {

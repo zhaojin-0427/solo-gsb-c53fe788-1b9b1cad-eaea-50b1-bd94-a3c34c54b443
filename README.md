@@ -2,6 +2,8 @@
 
 本地运行的 Web 应用：上传 **RGB / CMYK 的 TIFF、PNG 或 JPEG** 图像，选择**源 ICC 配置、印刷 ICC 配置、显示 ICC 配置**与渲染意图，由后端通过 **LittleCMS 2（直接 ctypes 调用 + Pillow ImageCms）** 完成全链路色彩转换，并在浏览器中进行显示器软打样、像素级 **CIEDE2000 色差**分析与区域取色。源色与印后色以 LittleCMS 原生 `TYPE_Lab_DBL`（C double）高精度 Lab 取得，不再经过 Pillow 8 位 `LAB` 模式的额外量化。
 
+此外内置 **印刷配置版本发布与回归门禁** 模块：把同一配置族的候选印刷 ICC 存为按 SHA-256 固定的草稿，从已保存的代表性任务固化门禁基线，服务按草稿快照自动重跑并逐项给出 ΔE 均值 / P95 / 超阈面积比例 / 遮罩变化像素的通过-失败判定与变化像素定位；**全部通过才能在事务中发布为当前版本**，发布、撤回、恢复（回滚）均带期望版本号并发控制并写不可变哈希链审计。
+
 - 后端：Python 3.12 · FastAPI · SQLite · liblcms2 直接 ctypes（高精度 Lab）+ Pillow（图像 I/O/ImageCms）· NumPy
 - 前端：原生 HTML / CSS / JavaScript（无框架、无构建步骤）
 - 部署：Docker Compose 一键启动
@@ -20,13 +22,18 @@ docker compose up -d --build
 
 > **http://localhost:8000**
 
+页面顶部导航可在两个视图间切换：
+
+- **软打样**：上传图像、选择配置/意图/阈值，生成软打样与 ΔE 分析；
+- **印刷配置版本发布与回归门禁**：配置族、草稿、基线、门禁结果、版本发布/撤回/回滚与审计。
+
 停止：
 
 ```bash
 docker compose down
 ```
 
-数据（上传的图像任务、ICC 配置、SQLite 数据库）保存在 Docker 卷 `softproof-data`（容器内 `/data`）中，容器重启后仍然存在。
+数据（上传的图像任务、ICC 配置、草稿/版本快照、门禁基线与产物、SQLite 数据库）保存在 Docker 卷 `softproof-data`（容器内 `/data`）中，容器重启后仍然存在。
 
 ### 不使用 Docker（本地开发）
 
@@ -136,6 +143,60 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ---
 
+## 印刷配置版本发布与回归门禁
+
+用于在更换/升级印刷 ICC 配置时，用固定的代表性任务做回归把关，防止配置改动造成大面积色差或超阈遮罩漂移。
+
+### 概念
+
+- **配置族（family）**：同一印刷机/工艺的一组草稿与已发布版本。族上有单调递增的 **族版本号 `revision`**，是发布/撤回/恢复操作的**期望版本号（乐观锁）**。
+- **草稿（draft）**：上传到族上的候选印刷 ICC。服务校验其为合法 CMYK 输出配置后，按内容 **SHA-256** 存为不可变快照 `/data/release/snapshots/<sha256>.icc`；同一族再传新草稿会取代旧草稿的“开放”状态，但历史记录与快照保留。
+- **基线（baseline）**：从一个**已保存的代表性任务**固化而来的自包含夹具。固定内容包括：
+  - 原始图像字节（SHA-256 校验）；
+  - 源 ICC（按任务的源配置解析，或图像内嵌 ICC）、显示 ICC（SHA-256 校验）；
+  - 源→印刷、Lab→显示两个渲染意图与 ΔE 阈值；
+  - 任务当时的二值超阈遮罩；
+  - 四项允许上限：**ΔE 均值、ΔE P95、超阈面积比例（0..1）、遮罩变化像素数**。
+- **门禁运行（gate run）**：服务**按草稿 ICC 的 SHA-256 取出固定快照**，替换基线任务的印刷配置，对族内**全部基线**重跑流水线，逐项返回 `passed/failed`、实测值、基线参考值、上限与中文原因；`run_id = SHA(草稿快照, 基线集合)`，**同输入重跑复用同一报告与产物**，因此历史报告可按版本复现。
+- **版本发布**：只有全部门禁通过，才在**单个数据库事务**内完成：旧 `current → superseded`、草稿分配新版本号并置为 `current`、族 `current_version_id` 与 `revision` 前进、追加审计。失败则**保留草稿**、族当前版本不变。
+- **撤回 / 恢复（回滚）**：可撤回当前版本（族暂时没有 current）；任何已发布的历史版本（被取代或已撤回）都可恢复为当前版本，恢复不需要重跑门禁——该版本发布时的门禁报告按 `gate_run_id` 仍可完整复现。两者都必须带期望版本号，过期返回 **409 Conflict**。
+- **不可变审计**：族创建、草稿上传、基线固化、发布、撤回、恢复都会向 `audit_log` 追加一条带 `prev_hash/entry_hash` 的**哈希链**记录；表上建有 SQLite 触发器，任何 `UPDATE`/`DELETE` 都会被数据库直接拒绝。
+
+### 页面操作流程
+
+1. 在顶部进入 **印刷配置版本发布与回归门禁** 视图；
+2. 左侧 **新建配置族**（如 “GRACoL2013-CRPC6”）；
+3. 先到 **软打样** 视图跑一个代表性任务；回到发布视图，在 **① 门禁基线** 区从“最近已保存任务”下拉选中它，填写基线名称与四项允许上限，点击 **从所选任务固化基线**；
+4. 在 **②** 区上传候选印刷 ICC 草稿（可打标签）；
+5. 点击 **③ 运行回归门禁**：每个基线给出四项判定表、候选软打样/候选超阈遮罩/变化像素定位图（红=新增超阈、蓝=消失超阈、灰=一致）以及变化像素坐标 CSV 下载；
+6. 全部通过后点 **④ 在事务中发布**（按钮显示当前族版本号作为期望版本号；失败时按钮禁用）；
+7. 在 **版本与回滚** 表中可撤回当前版本、恢复（回滚）到任意历史版本、下载该版 ICC、打开发布时的门禁报告；左侧底部可展开查看当前族的哈希链审计日志。
+
+### 进行中任务与历史版本的快照绑定
+
+发布时，该版 ICC 以**不可变文件名** `release-<sha256前16位>.icc` 写入 `/data/profiles/press/` 并立即出现在软打样页的印刷配置下拉中；文件按内容寻址、**永不覆盖**。普通软打样任务的 `job_id` 由“图像哈希 + 三份配置哈希 + 意图 + 阈值”决定，因此：
+
+- 发布新版本不会改动旧文件，**进行中/已存在的任务继续绑定原快照**，同输入永远命中原任务目录与报告；
+- 新版本发布后，旧版本状态变为 `superseded` 但其 ICC 与门禁产物仍在，**历史报告可按版本（`gate_run_id`）字节级复现**；
+- 回滚只切换数据库中的“当前版本”指针，不修改任何 ICC 文件。
+
+### 模块数据目录（容器内 `/data/release`）
+
+```
+/data/release/
+├── snapshots/<sha256>.icc          # 草稿/版本 ICC 不可变快照（内容寻址）
+├── baselines/<baseline_id>/       # 基线自包含夹具
+│   ├── image.bin                  #   固定的原始图像
+│   ├── source.icc                 #   固定的源 ICC（内嵌源时为空）
+│   ├── display.icc                #   固定的显示 ICC
+│   ├── press-ref.icc              #   基线原印刷 ICC（参考复算用）
+│   └── mask_ref.npy               #   基线二值超阈遮罩
+└── gates/<run_id>/<baseline_id>/  # 门禁产物：softproof/mask/diff PNG、
+                                   # changed_pixels.csv、mask_changed.npy、report.json
+```
+
+---
+
 ## HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -150,6 +211,31 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/jobs/{id}/report` | 下载 report.json |
 | GET | `/api/jobs/{id}/export.zip` | 全部 PNG + JSON 打包下载 |
 | POST | `/api/jobs/{id}/region` | 区域分析，body：`{x,y,width,height}` |
+
+### 发布与回归门禁 API（前缀 `/api/release`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/families` | 配置族列表（含当前版本、开放草稿、版本/基线数、revision） |
+| POST | `/families` | 新建配置族，body：`{name}` |
+| GET | `/families/{fid}` | 族详情（全部版本、基线、最近门禁） |
+| POST | `/families/{fid}/drafts` | 上传候选印刷 ICC 草稿（multipart `file` + 可选 `label`），严格 CMYK 校验，按 SHA-256 固定快照 |
+| GET | `/versions/{vid}` | 版本/草稿详情（发布版本附带其门禁报告，可按版本复现） |
+| GET | `/versions/{vid}/icc` | 下载该草稿/版本绑定的固定 ICC |
+| GET | `/families/{fid}/baselines` | 列出基线 |
+| POST | `/families/{fid}/baselines` | 从已保存任务固化基线，body：`{name, job_id, limit_de_mean, limit_de_p95, limit_over_ratio, limit_changed_pixels}` |
+| POST | `/families/{fid}/gates` | 运行回归门禁，body：`{draft_version_id}`；逐项返回判定/实测/原因/定位 |
+| GET | `/gates/{run_id}` | 门禁报告（确定性 run_id，可历史复现） |
+| GET | `/gates/{run_id}/baselines/{bid}/softproof.png` | 候选软打样 |
+| GET | `/gates/{run_id}/baselines/{bid}/mask.png` | 候选超阈遮罩 |
+| GET | `/gates/{run_id}/baselines/{bid}/diff.png` | 变化像素定位图（红新增/蓝消失/灰一致） |
+| GET | `/gates/{run_id}/baselines/{bid}/changed_pixels.csv` | 变化像素坐标清单（y,x,kind） |
+| POST | `/families/{fid}/publish` | 事务内发布，body：`{draft_version_id, expected_revision, label?}`；门禁失败 422，期望版本号冲突 409 |
+| POST | `/versions/{vid}/withdraw` | 撤回当前版本，body：`{expected_revision, reason?}` |
+| POST | `/versions/{vid}/restore` | 恢复/回滚到历史版本，body：`{expected_revision, reason?}` |
+| GET | `/audit?family_id=&limit=` | 哈希链不可变审计列表 |
+
+错误码：请求语义/状态非法 `422`，资源不存在 `404`，期望版本号冲突 `409`。
 
 `POST /api/jobs` 表单字段：
 
@@ -177,15 +263,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由
-│   ├── pipeline.py      # 色彩流水线、导出
+│   ├── release_api.py   # 发布/门禁 HTTP API
+│   ├── releases.py      # 配置族/草稿/基线/门禁/发布/撤回/恢复/审计 服务
+│   ├── pipeline.py      # 色彩流水线、导出（支持按快照字节重跑）
 │   ├── colorscience.py  # CIEDE2000、热图（高精度 Lab 由 lcms_native 取得）
 │   ├── profiles.py      # ICC 配置管理与严格校验
 │   ├── regions.py       # 框选区域统计
-│   ├── database.py      # SQLite
+│   ├── database.py      # SQLite（含发布模块表、不可变审计触发器、写事务锁）
 │   ├── lcms_native.py   # liblcms2 ctypes 绑定（TYPE_Lab_DBL 高精度转换）、内置配置生成
 │   ├── config.py
-│   └── static/          # 前端
-├── tests/               # pytest 端到端测试
+│   └── static/          # 前端（软打样 + 发布门禁两个视图）
+├── tests/               # pytest 端到端测试（软打样 + 发布门禁）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -197,3 +285,5 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 pip install -r requirements.txt pytest httpx
 pytest -q
 ```
+
+测试覆盖：软打样原有全链路与校验（25 项），以及发布门禁模块（配置族/草稿 CMYK 校验、基线固化与参数校验、相同快照通过、异配置检出变化像素并拒绝发布、门禁 run 确定性与历史复现、发布后配置可选与不可变文件名、期望版本号 409、撤回/恢复状态机、审计哈希链与 UPDATE/DELETE 触发器拦截）。
