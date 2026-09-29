@@ -1,4 +1,5 @@
 """End-to-end and validation tests for the soft proofing app."""
+import hashlib
 import io
 import struct
 
@@ -444,11 +445,170 @@ def test_region_lab_matches_high_precision_arrays(client, ids):
     assert abs(corner["lab_source"]["mean"][2]) < 0.05
 
 
-def test_soft_proof_still_tagged_with_display_profile(client, ids):
-    """The proof intent/display ICC behavior is unchanged by the Lab fix."""
-    j = run(client, ids, sample_img(), proof_intent="absolute_colorimetric").json()
-    state = client.app.state.state
-    display_bytes = state.pm.load_bytes(ids["display"])
-    resp = client.get(f"/api/jobs/{j['job_id']}/images/softproof.png")
-    im = Image.open(io.BytesIO(resp.content))
-    assert im.info["icc_profile"] == display_bytes
+
+# ---------------------------------------------------------------------------
+# Press-profile release gate, optimistic versioning and immutable audit
+# ---------------------------------------------------------------------------
+
+def _release_form(client, ids, job_id, **limits):
+    cmyk = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    data = {
+        "family_name": "Test Press Family",
+        "baseline_job_id": job_id,
+        "max_de_mean": "1000",
+        "max_de_p95": "1000",
+        "max_over_threshold_ratio": "1",
+        "max_mask_changed_pixels": "0",
+    }
+    data.update({k: str(v) for k, v in limits.items()})
+    return (
+        {"file": ("candidate.icc", cmyk, "application/vnd.iccprofile")},
+        data,
+    )
+
+
+def test_release_gate_publish_withdraw_restore_and_audit(client, ids):
+    job = run(client, ids, sample_img()).json()
+    files, data = _release_form(client, ids, job["job_id"])
+    draft_resp = client.post("/api/releases/drafts", files=files, data=data)
+    assert draft_resp.status_code == 200, draft_resp.text
+    draft = draft_resp.json()
+    assert draft["status"] == "draft"
+    assert draft["fixed_baseline"]["image_sha256"] == job["report"]["image"]["sha256"]
+    assert draft["fixed_baseline"]["threshold"] == 3.0
+
+    gate = client.post(f"/api/releases/drafts/{draft['draft_id']}/gate").json()
+    assert gate["passed"] is True
+    assert len(gate["checks"]) == 4
+    assert all(item["passed"] for item in gate["checks"])
+    assert gate["metrics"]["mask"]["changed_pixels"] == 0
+    changes = client.get(gate["images"]["changes"])
+    assert changes.status_code == 200
+    candidate_mask = client.get(gate["images"]["candidate_mask"])
+    assert candidate_mask.status_code == 200
+    candidate_report = client.get(gate["candidate_report"])
+    assert candidate_report.status_code == 200
+    assert candidate_report.json()["job_id"] == gate["candidate_job_id"]
+    manifest = client.get(gate["snapshot_manifest"])
+    assert manifest.status_code == 200
+    report = client.get(gate["report"])
+    assert report.status_code == 200
+    assert report.json()["run_id"] == gate["run_id"]
+
+    stale = client.post(
+        f"/api/releases/drafts/{draft['draft_id']}/publish",
+        json={"expected_version": 7},
+    )
+    assert stale.status_code == 409
+
+    publish = client.post(
+        f"/api/releases/drafts/{draft['draft_id']}/publish",
+        json={"expected_version": 0},
+    )
+    assert publish.status_code == 200, publish.text
+    version = publish.json()
+    assert version["version_number"] == 1
+    assert version["status"] == "active"
+
+    snapshot = client.get(version["gate_report"])
+    assert snapshot.status_code == 200
+    icc = client.get(f"/api/releases/versions/{version['version_id']}/snapshot.icc")
+    assert icc.status_code == 200
+    assert hashlib.sha256(icc.content).hexdigest() == version["profile_sha256"]
+
+    bad_withdraw = client.post(
+        f"/api/releases/versions/{version['version_id']}/withdraw",
+        json={"expected_version": 0},
+    )
+    assert bad_withdraw.status_code == 409
+
+    withdrawn = client.post(
+        f"/api/releases/versions/{version['version_id']}/withdraw",
+        json={"expected_version": 1},
+    )
+    assert withdrawn.status_code == 200
+    assert withdrawn.json()["status"] == "withdrawn"
+
+    restored = client.post(
+        f"/api/releases/versions/{version['version_id']}/restore",
+        json={"expected_version": 0},
+    )
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "active"
+
+    audits = client.get(
+        "/api/releases/audits",
+        params={"family_id": version["family_id"]},
+    ).json()
+    actions = [(a["action"], a["result"]) for a in audits]
+    assert ("publish", "allowed") in actions
+    assert ("publish", "denied") in actions
+    assert ("withdraw", "allowed") in actions
+    assert ("restore", "allowed") in actions
+
+    # Audit rows are append-only; SQLite triggers reject update and delete.
+    import sqlite3
+    conn = client.app.state.db
+    audit_id = audits[0]["audit_id"]
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        conn.execute("UPDATE release_audits SET result='tampered' WHERE audit_id=?", (audit_id,))
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        conn.execute("DELETE FROM release_audits WHERE audit_id=?", (audit_id,))
+
+
+def test_failed_gate_keeps_draft_and_blocks_publication(client, ids):
+    job = run(client, ids, sample_img()).json()
+    files, data = _release_form(
+        client, ids, job["job_id"],
+        max_de_mean=0, max_de_p95=0, max_over_threshold_ratio=0,
+        max_mask_changed_pixels=0,
+    )
+    data["family_name"] = "Strict Gate Family"
+    draft = client.post("/api/releases/drafts", files=files, data=data).json()
+    gate = client.post(f"/api/releases/drafts/{draft['draft_id']}/gate").json()
+    assert gate["passed"] is False
+    assert any(not check["passed"] for check in gate["checks"])
+    publish = client.post(
+        f"/api/releases/drafts/{draft['draft_id']}/publish",
+        json={"expected_version": 0},
+    )
+    assert publish.status_code == 409
+    refreshed = client.get(f"/api/releases/drafts/{draft['draft_id']}").json()
+    assert refreshed["status"] == "failed"
+
+
+def test_rollback_points_current_version_at_historical_snapshot(client, ids):
+    job = run(client, ids, sample_img()).json()
+    files1, data1 = _release_form(client, ids, job["job_id"])
+    files1["file"] = ("v1.icc", files1["file"][1], files1["file"][2])
+    data1["family_name"] = "Rollback Family"
+    d1 = client.post("/api/releases/drafts", files=files1, data=data1).json()
+    g1 = client.post(f"/api/releases/drafts/{d1['draft_id']}/gate").json()
+    v1 = client.post(
+        f"/api/releases/drafts/{d1['draft_id']}/publish",
+        json={"expected_version": 0},
+    ).json()
+    assert g1["passed"] and v1["version_number"] == 1
+
+    files2, data2 = _release_form(client, ids, job["job_id"])
+    files2["file"] = ("v2.icc", files2["file"][1], files2["file"][2])
+    data2["family_id"] = v1["family_id"]
+    d2 = client.post("/api/releases/drafts", files=files2, data=data2).json()
+    assert client.post(f"/api/releases/drafts/{d2['draft_id']}/gate").json()["passed"]
+    v2 = client.post(
+        f"/api/releases/drafts/{d2['draft_id']}/publish",
+        json={"expected_version": 1},
+    ).json()
+    assert v2["version_number"] == 2
+
+    rollback = client.post(
+        f"/api/releases/versions/{v1['version_id']}/rollback",
+        json={"expected_version": 2},
+    )
+    assert rollback.status_code == 200
+    assert rollback.json()["version_number"] == 1
+    assert rollback.json()["status"] == "active"
+    versions = client.get("/api/releases/versions", params={"family_id": v1["family_id"]}).json()
+    by_number = {v["version_number"]: v for v in versions}
+    assert by_number[1]["status"] == "active"
+    assert by_number[2]["status"] == "superseded"

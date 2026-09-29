@@ -117,6 +117,105 @@
       <pre id="reportJson"></pre>
     </details>
   </section>
+
+  <section class="panel release-panel">
+    <h2>4. 印刷配置版本发布与回归门禁</h2>
+    <div class="release-grid">
+      <div class="release-card">
+        <h3>上传草稿并固定基线</h3>
+        <div class="formgrid">
+          <label>配置族
+            <select id="releaseFamilySelect">
+              <option value="">＋ 新建配置族</option>
+            </select>
+          </label>
+          <label>新配置族名称（新建时填写）
+            <input type="text" id="releaseFamilyName" placeholder="例如：Fogra-Coated-V2">
+          </label>
+          <label>代表性基线任务
+            <select id="baselineJobSelect"></select>
+          </label>
+          <label>候选印刷 ICC（草稿）
+            <input type="file" id="releaseProfileFile" accept=".icc,.icm">
+          </label>
+        </div>
+        <div class="formgrid limits-grid">
+          <label>允许 ΔE 均值上限
+            <input type="number" id="limitMean" value="2.0" min="0" step="0.1">
+          </label>
+          <label>允许 ΔE P95 上限
+            <input type="number" id="limitP95" value="5.0" min="0" step="0.1">
+          </label>
+          <label>允许超阈面积比例上限
+            <input type="number" id="limitOverRatio" value="0.02" min="0" max="1" step="0.001">
+          </label>
+          <label>允许遮罩变化像素上限
+            <input type="number" id="limitChanged" value="100" min="0" step="1">
+          </label>
+        </div>
+        <div class="row">
+          <button type="button" id="createDraftBtn" class="primary">上传草稿 / 固定快照</button>
+          <span id="releaseMsg" class="hint"></span>
+        </div>
+        <div id="releaseError" class="error" hidden></div>
+      </div>
+
+      <div class="release-card">
+        <h3>当前族与版本</h3>
+        <div id="versionSummary" class="version-summary">尚未加载</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>版本</th><th>状态</th><th>配置 SHA-256</th><th>操作</th></tr>
+            </thead>
+            <tbody id="versionsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="release-grid wide">
+      <div class="release-card">
+        <h3>草稿与门禁结果</h3>
+        <div class="table-wrap tall">
+          <table>
+            <thead>
+              <tr><th>族</th><th>草稿</th><th>状态</th><th>门禁</th><th>操作</th></tr>
+            </thead>
+            <tbody id="draftsBody"></tbody>
+          </table>
+        </div>
+        <div id="gateDetail" class="gate-detail" hidden>
+          <div class="gate-head">
+            <h3 id="gateTitle">门禁结果</h3>
+            <a id="gateReportLink" class="btn" download>下载门禁报告</a>
+          </div>
+          <div id="gateChecks"></div>
+          <div class="gate-images">
+            <figure><img id="gateChangesImg" alt="变化像素定位"><figcaption>红=新增遮罩，蓝=消失遮罩</figcaption></figure>
+            <figure><img id="gateCandidateMask" alt="候选遮罩"><figcaption>候选遮罩</figcaption></figure>
+            <figure><img id="gateBaselineMask" alt="基线遮罩"><figcaption>基线遮罩</figcaption></figure>
+          </div>
+          <details>
+            <summary>查看定位坐标与完整 JSON</summary>
+            <pre id="gateJson"></pre>
+          </details>
+        </div>
+      </div>
+
+      <div class="release-card">
+        <h3>不可变审计</h3>
+        <div class="table-wrap tall">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>动作</th><th>期望/实际</th><th>结果</th><th>原因</th></tr>
+            </thead>
+            <tbody id="auditsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <footer>

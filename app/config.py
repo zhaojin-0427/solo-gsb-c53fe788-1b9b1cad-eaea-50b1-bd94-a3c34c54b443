@@ -15,6 +15,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SPD_DATA_DIR", BASE_DIR.parent / "data"))
 PROFILE_DIR = DATA_DIR / "profiles"
 JOB_DIR = DATA_DIR / "jobs"
+RELEASE_DIR = DATA_DIR / "releases"
+SNAPSHOT_DIR = RELEASE_DIR / "snapshots"
+GATE_RUN_DIR = RELEASE_DIR / "gate-runs"
 DB_PATH = DATA_DIR / "softproof.db"
 
 MAX_DIMENSION = int(os.environ.get("SPD_MAX_DIMENSION", "3000"))

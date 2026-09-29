@@ -13,6 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from . import database as db
 from . import pipeline as pl
 from . import regions as regions_mod
+from . import storage
+from . import releases
 from .config import (
     DB_PATH,
     JOB_DIR,
@@ -30,13 +32,16 @@ async def lifespan(app: FastAPI):
     db.init_db(conn)
     for rec in state.pm.list_profiles():
         db.upsert_profile(conn, rec)
+    conn.commit()
     app.state.db = conn
     app.state.state = state
     yield
     conn.close()
 
 
-app = FastAPI(title="印前色彩软打样台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="印前色彩软打样台", version="1.1.0", lifespan=lifespan)
+
+app.include_router(releases.router)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -79,6 +84,7 @@ def list_profiles():
             groups[rec.role].append(d)
     for items in groups.values():
         items.sort(key=lambda d: (not d["builtin"], d["name"]))
+    app.state.db.commit()
     return groups
 
 
@@ -95,6 +101,7 @@ async def upload_profile(role: str, file: UploadFile = File(...)):
     except ProfileError as exc:
         raise HTTPException(422, str(exc))
     db.upsert_profile(app.state.db, rec)
+    app.state.db.commit()
     return rec.to_dict()
 
 
@@ -136,78 +143,21 @@ async def create_job(
 
     job_id = pl.compute_job_id(result)
     base = job_dir(job_id)
-
-    # Persist pixel arrays for region inspection at full double precision so
-    # inspection and report statistics come from exactly the same Lab/ΔE
-    # values that decided mask membership.
-    np.save(base / "lab_src.npy", result.lab_src.astype(np.float64))
-    np.save(base / "lab_press.npy", result.lab_press.astype(np.float64))
-    np.save(base / "cmyk.npy", result.cmyk.astype(np.uint8))
-    np.save(base / "de.npy", result.de.astype(np.float64))
-    np.save(base / "heatmap.npy", result.heatmap.astype(np.uint8))
-    np.save(base / "mask3.npy", result.mask.astype(np.uint8))
-    (base / "original.bin").write_bytes(data)
-
-    display_icc_bytes = state.pm.load_bytes(display_profile)
-    pngs = pl.export_pngs(result, state.srgb_bytes, display_icc_bytes)
-    for name, blob in pngs.items():
-        (base / name).write_bytes(blob)
-
-    report = pl.build_report(result, job_id)
-    (base / "report.json").write_text(
-        json.dumps(report, sort_keys=True, ensure_ascii=False, indent=2), "utf-8"
+    job_record = storage.persist_pipeline_result(
+        result=result,
+        job_id=job_id,
+        image_data=data,
+        source_profile=source_profile,
+        press_profile=press_profile,
+        display_profile=display_profile,
+        base=base,
+        pm=state.pm,
+        srgb_bytes=state.srgb_bytes,
     )
+    db.insert_job(app.state.db, job_record)
+    app.state.db.commit()
 
-    meta = {
-        "job_id": job_id,
-        "width": result.img.size[0],
-        "height": result.img.size[1],
-        "mode": result.mode,
-        "image_sha256": result.image_sha,
-        "embedded_sha256": result.embedded_sha,
-        "source_profile": source_profile,
-        "press_profile": press_profile,
-        "display_profile": display_profile,
-        "source_intent": source_intent,
-        "proof_intent": proof_intent,
-        "threshold": threshold,
-        "use_embedded": use_embedded,
-    }
-    (base / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), "utf-8")
-
-    db.insert_job(app.state.db, {
-        "job_id": job_id,
-        "image_sha256": result.image_sha,
-        "width": result.img.size[0],
-        "height": result.img.size[1],
-        "image_mode": result.mode,
-        "source_profile": source_profile if not use_embedded else "<embedded>",
-        "press_profile": press_profile,
-        "display_profile": display_profile,
-        "source_intent": source_intent,
-        "proof_intent": proof_intent,
-        "threshold": threshold,
-        "use_embedded": use_embedded,
-        "embedded_sha256": result.embedded_sha,
-        "parameters": report["parameters"],
-        "profile_digests": {k: v["sha256"] for k, v in result.profile_summaries.items()},
-        "stats": result.stats,
-    })
-
-    return {
-        "job_id": job_id,
-        "width": result.img.size[0],
-        "height": result.img.size[1],
-        "stats": result.stats,
-        "report": report,
-        "images": {
-            "preview": f"/api/jobs/{job_id}/images/preview.png",
-            "softproof": f"/api/jobs/{job_id}/images/softproof.png",
-            "heatmap": f"/api/jobs/{job_id}/images/heatmap.png",
-            "overlay": f"/api/jobs/{job_id}/images/overlay.png",
-            "mask": f"/api/jobs/{job_id}/images/mask.png",
-        },
-    }
+    return storage.response_from_result(result, job_id)
 
 
 # ---------------------------------------------------------------------------

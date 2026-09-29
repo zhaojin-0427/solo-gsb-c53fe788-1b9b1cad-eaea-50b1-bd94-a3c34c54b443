@@ -16,9 +16,17 @@
 docker compose up -d --build
 ```
 
-启动后浏览器访问：
+服务启动后浏览器访问：
 
 > **http://localhost:8000**
+
+页面操作流程：
+
+1. 在第 1～3 区上传代表性图像，选择源/印刷/显示 ICC、渲染意图和阈值，生成一个可重复的基线任务；
+2. 在第 4 区选择或新建印刷配置族，上传候选印刷 ICC 作为草稿，并设置 ΔE 均值、P95、超阈面积比例、遮罩变化像素四项门禁上限；
+3. 草稿会固定基线图像、源/显示配置、基线印刷配置和参数；点击“重跑门禁”查看逐项结果和变化像素定位；
+4. 门禁全部通过后，输入页面显示的期望版本号并发布；失败时草稿保留，可继续修改；
+5. 在版本表中撤回当前版本、恢复已撤回版本，或回滚到历史版本；所有操作都会写入不可变审计。
 
 停止：
 
@@ -26,7 +34,7 @@ docker compose up -d --build
 docker compose down
 ```
 
-数据（上传的图像任务、ICC 配置、SQLite 数据库）保存在 Docker 卷 `softproof-data`（容器内 `/data`）中，容器重启后仍然存在。
+数据（上传的图像任务、ICC 配置、发布草稿、不可变快照、门禁报告、SQLite 数据库）保存在 Docker 卷 `softproof-data`（容器内 `/data`）中，容器重启后仍然存在。
 
 ### 不使用 Docker（本地开发）
 
@@ -61,6 +69,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 **热图、遮罩、统计、框选区域的 Lab/色差值与导出报告全部取自同一份双精度 Lab/ΔE 结果**——阈值设在像素实际 ΔE00 附近时，不会因为源色/印后色被先写成 Pillow 8 位 LAB 再解码而错误翻转临界像素的遮罩归属或超阈面积比例。
 
 输出给浏览器的 PNG 均嵌入 ICC 配置，浏览器不会按未标记数据自行解释：**源图显示预览与软打样嵌入所选择的显示配置**（像素本身位于该显示空间）；**ΔE 热图、遮罩与叠加图是无物理色度含义的合成可视化，嵌入 sRGB** 以保证颜色稳定呈现。
+
+### 印刷配置版本发布与回归门禁
+
+页面第 4 区提供同一**印刷配置族**的草稿、回归门禁、发布、撤回、恢复与回滚操作：
+
+1. 先正常运行一个代表性图像任务，并确认其源/印刷/显示配置、渲染意图和 ΔE 阈值可作为基线；
+2. 在“**上传草稿并固定基线**”中选择已有配置族或输入新族名，选择基线任务，上传候选印刷 ICC，并设置四项门禁上限：
+   - 候选任务允许的 ΔE00 **均值**上限；
+   - 候选任务允许的 ΔE00 **P95**上限；
+   - 候选任务允许的**超阈面积比例**上限；
+   - 候选遮罩相对基线遮罩允许的**变化像素数**上限；
+3. 保存草稿时，服务记录候选 ICC 的 SHA-256；运行门禁时再把候选 ICC、基线原图、源/显示 ICC、基线印刷 ICC、渲染意图和阈值复制到 `/data/releases/snapshots/` 中按 SHA-256 校验的不可变快照；
+4. 服务以固定快照重跑完整流水线，逐项返回均值、P95、超阈面积、遮罩变化的通过/失败、候选值/基线值/上限和原因；变化像素给出坐标采样、整体包围盒，并提供红色（新增遮罩）/蓝色（消失遮罩）定位图；
+5. **任一门禁项失败都不能发布**，草稿保留为失败状态，可替换或继续重跑；全部通过后，在数据库事务中把旧当前版本标记为 `superseded`、插入新 `active` 版本并更新当前版本号；
+6. 撤回当前版本后配置族暂时没有当前版本；已撤回版本可“恢复”，历史 `superseded` 版本可“回滚”为当前版本。恢复/回滚只切换指向不可变快照的当前指针，不复制或修改历史 ICC。
+
+发布、撤回、恢复和回滚都必须提交页面显示的**期望当前版本号**（首次发布为 `0`）。版本不一致时返回 `409`，并向不可变审计表追加一条 `denied` 记录；审计表由 SQLite trigger 禁止 `UPDATE`/`DELETE`。历史版本详情、门禁 JSON、候选任务报告和版本 ICC 快照都可重新下载，历史报告可按版本复现。正在执行的普通任务在进入流水线时读取自己的 ICC 字节，不会因后续发布新版本而改变。
 
 ### 渲染意图
 
@@ -150,6 +175,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/jobs/{id}/report` | 下载 report.json |
 | GET | `/api/jobs/{id}/export.zip` | 全部 PNG + JSON 打包下载 |
 | POST | `/api/jobs/{id}/region` | 区域分析，body：`{x,y,width,height}` |
+| GET | `/api/releases/overview` | 一次读取配置族、草稿、门禁、版本、审计和可选基线任务 |
+| POST | `/api/releases/drafts` | 上传候选印刷 ICC，固定基线任务和四项门禁上限 |
+| POST | `/api/releases/drafts/{id}/gate` | 用草稿 ICC 的 SHA-256 快照重跑门禁 |
+| GET | `/api/releases/gate-runs/{id}` | 门禁逐项结果、指标、变化坐标采样和产物链接 |
+| GET | `/api/releases/gate-runs/{id}/changes.png` | 遮罩变化像素定位图（红新增/蓝消失） |
+| GET | `/api/releases/gate-runs/{id}/report` | 门禁 JSON 报告 |
+| POST | `/api/releases/drafts/{id}/publish` | 门禁全过后事务发布；body：`{"expected_version":0}` |
+| POST | `/api/releases/versions/{id}/withdraw` | 撤回当前版本；期望版本号乐观并发控制 |
+| POST | `/api/releases/versions/{id}/restore` | 恢复已撤回版本为当前版本 |
+| POST | `/api/releases/versions/{id}/rollback` | 回滚到历史 `superseded` 快照 |
+| GET | `/api/releases/versions/{id}/snapshot.icc` | 下载发布版本绑定的不可变 ICC |
+| GET | `/api/releases/versions/{id}/gate-report` | 下载该版本发布时的门禁报告 |
+| GET | `/api/releases/audits` | 查询不可变发布/撤回/恢复/回滚审计 |
 
 `POST /api/jobs` 表单字段：
 
@@ -181,7 +219,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── colorscience.py  # CIEDE2000、热图（高精度 Lab 由 lcms_native 取得）
 │   ├── profiles.py      # ICC 配置管理与严格校验
 │   ├── regions.py       # 框选区域统计
-│   ├── database.py      # SQLite
+│   ├── database.py      # SQLite：任务、配置族、版本、门禁与不可变审计
+│   ├── releases.py      # 草稿、SHA-256 快照、回归门禁和版本事务
+│   ├── storage.py       # 确定性任务产物持久化
 │   ├── lcms_native.py   # liblcms2 ctypes 绑定（TYPE_Lab_DBL 高精度转换）、内置配置生成
 │   ├── config.py
 │   └── static/          # 前端

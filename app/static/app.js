@@ -5,6 +5,8 @@ const state = {
   profiles: { source: [], press: [], display: [] },
   job: null,
   view: "preview",
+  releases: null,
+  selectedGateId: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -111,6 +113,7 @@ $("runBtn").addEventListener("click", async () => {
     const job = await api("/api/jobs", { method: "POST", body: fd });
     state.job = job;
     renderJob();
+    loadReleases().catch(() => {});
   } catch (err) {
     showError(err.message);
   } finally {
@@ -249,4 +252,338 @@ async function queryRegion(x, y, w, h) {
   }
 }
 
-loadProfiles().catch((e) => showError("加载配置列表失败: " + e.message));
+
+// ---------------------------------------------------------------------------
+// Press-profile drafts, regression gates and releases
+// ---------------------------------------------------------------------------
+
+async function apiRaw(path, options) {
+  const res = await fetch(path, options);
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const err = new Error(data && data.detail ? data.detail : `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+function showReleaseError(msg) {
+  const box = $("releaseError");
+  box.hidden = !msg;
+  box.textContent = msg || "";
+}
+
+function shortSha(sha) {
+  return sha ? `${sha.slice(0, 12)}…` : "—";
+}
+
+function shortId(id) {
+  return id ? `${id.slice(0, 10)}…` : "—";
+}
+
+function statusLabel(status) {
+  return {
+    active: "当前",
+    superseded: "已替代",
+    withdrawn: "已撤回",
+    draft: "待门禁",
+    passed: "门禁通过",
+    failed: "门禁失败",
+    published: "已发布",
+  }[status] || status;
+}
+
+async function loadReleases() {
+  state.releases = await apiRaw("/api/releases/overview");
+  renderReleases();
+}
+
+function currentFamily() {
+  const fid = $("releaseFamilySelect").value;
+  return state.releases.families.find((f) => f.family_id === fid) || null;
+}
+
+function renderReleases() {
+  const data = state.releases;
+  if (!data) return;
+
+  const familySelect = $("releaseFamilySelect");
+  const wantedFamily = familySelect.value;
+  familySelect.innerHTML = '<option value="">＋ 新建配置族</option>';
+  for (const f of data.families) {
+    const opt = document.createElement("option");
+    opt.value = f.family_id;
+    opt.textContent = `${f.name}${f.current_version ? `（当前 v${f.current_version}）` : "（无当前版本）"}`;
+    familySelect.appendChild(opt);
+  }
+  familySelect.value = wantedFamily;
+
+  const jobs = data.jobs || [];
+  const jobSelect = $("baselineJobSelect");
+  const wantedJob = jobSelect.value;
+  jobSelect.innerHTML = "";
+  for (const job of jobs) {
+    const opt = document.createElement("option");
+    opt.value = job.job_id;
+    opt.textContent = `${shortId(job.job_id)} · ${job.width}×${job.height} · ${job.press_profile} · ΔE均值 ${Number(job.de_mean).toFixed(2)}`;
+    jobSelect.appendChild(opt);
+  }
+  if (wantedJob) jobSelect.value = wantedJob;
+  if (!jobSelect.value && state.job) jobSelect.value = state.job.job_id;
+
+  const fid = familySelect.value;
+  const family = data.families.find((f) => f.family_id === fid);
+  const familyVersions = fid ? data.versions.filter((v) => v.family_id === fid) : data.versions;
+  renderVersions(family, familyVersions);
+  renderDrafts(fid);
+  renderAudits(fid);
+  renderGate();
+}
+
+function renderVersions(family, versions) {
+  const summary = $("versionSummary");
+  if (!family) {
+    summary.textContent = "选择已有配置族，或填写名称后上传第一个草稿。";
+  } else if (family.current_version) {
+    summary.innerHTML = `<b>${family.name}</b> 当前版本：<b>v${family.current_version}</b>`;
+  } else {
+    summary.innerHTML = `<b>${family.name}</b>：当前无 active 版本（可恢复撤回版本）`;
+  }
+
+  const body = $("versionsBody");
+  body.innerHTML = "";
+  if (!versions.length) {
+    body.innerHTML = '<tr><td colspan="4" class="muted">暂无版本</td></tr>';
+    return;
+  }
+  for (const v of versions.slice(0, 20)) {
+    const tr = document.createElement("tr");
+    const actions = document.createElement("div");
+    actions.className = "mini-actions";
+
+    const reportLink = document.createElement("a");
+    reportLink.className = "btn";
+    reportLink.textContent = "报告";
+    reportLink.href = v.gate_report;
+    reportLink.target = "_blank";
+    actions.appendChild(reportLink);
+
+    const iccLink = document.createElement("a");
+    iccLink.className = "btn";
+    iccLink.textContent = "ICC";
+    iccLink.href = v.snapshot;
+    iccLink.download = "";
+    actions.appendChild(iccLink);
+
+    if (v.status === "active") {
+      const btn = document.createElement("button");
+      btn.textContent = "撤回";
+      btn.onclick = () => {
+        const f = state.releases.families.find((item) => item.family_id === v.family_id);
+        versionAction(v, "withdraw", f ? f.current_version : 0);
+      };
+      actions.appendChild(btn);
+    } else if (v.status === "withdrawn") {
+      const btn = document.createElement("button");
+      btn.textContent = "恢复";
+      btn.className = "primary";
+      btn.onclick = () => versionAction(v, "restore", familyVersion(v.family_id));
+      actions.appendChild(btn);
+    } else if (v.status === "superseded") {
+      const btn = document.createElement("button");
+      btn.textContent = "回滚";
+      btn.className = "primary";
+      btn.onclick = () => versionAction(v, "rollback", familyVersion(v.family_id));
+      actions.appendChild(btn);
+    }
+
+    tr.innerHTML = `<td><code>v${v.version_number}</code><br><span class="muted">${familyName(v.family_id)}</span></td>
+      <td>${statusLabel(v.status)}</td><td><code title="${v.profile_sha256}">${shortSha(v.profile_sha256)}</code></td><td></td>`;
+    tr.lastElementChild.appendChild(actions);
+    body.appendChild(tr);
+  }
+}
+
+function familyVersion(fid) {
+  const f = state.releases.families.find((item) => item.family_id === fid);
+  return f ? (f.current_version || 0) : 0;
+}
+
+function familyName(fid) {
+  const f = state.releases.families.find((x) => x.family_id === fid);
+  return f ? f.name : shortId(fid);
+}
+
+function renderDrafts(fid) {
+  const body = $("draftsBody");
+  body.innerHTML = "";
+  const drafts = state.releases.drafts.filter((d) => !fid || d.family_id === fid).slice(0, 30);
+  if (!drafts.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">暂无草稿。先运行代表性任务，再上传候选印刷 ICC。</td></tr>';
+    return;
+  }
+  for (const d of drafts) {
+    const run = state.releases.gate_runs.find((r) => r.run_id === d.latest_run_id);
+    const tr = document.createElement("tr");
+    const actions = document.createElement("div");
+    actions.className = "mini-actions";
+
+    const gateBtn = document.createElement("button");
+    gateBtn.textContent = "重跑门禁";
+    gateBtn.onclick = () => runGate(d.draft_id);
+    actions.appendChild(gateBtn);
+
+    const viewBtn = document.createElement("button");
+    viewBtn.textContent = "查看结果";
+    viewBtn.disabled = !run;
+    viewBtn.onclick = () => { state.selectedGateId = run.run_id; renderGate(); };
+    actions.appendChild(viewBtn);
+
+    if (d.status === "passed" || (run && run.passed)) {
+      const pub = document.createElement("button");
+      pub.textContent = "发布";
+      pub.className = "primary";
+      const family = state.releases.families.find((f) => f.family_id === d.family_id);
+      pub.onclick = () => publishDraft(d, family.current_version || 0);
+      actions.appendChild(pub);
+    }
+
+    const gateText = run ? (run.passed ? "通过" : "失败") : "未运行";
+    tr.innerHTML = `<td>${familyName(d.family_id)}<br><code title="${d.candidate_sha256}">${shortSha(d.candidate_sha256)}</code></td>
+      <td><code>${shortId(d.draft_id)}</code><br><span class="muted">${d.candidate_name}</span></td>
+      <td>${statusLabel(d.status)}</td><td>${gateText}</td><td></td>`;
+    tr.lastElementChild.appendChild(actions);
+    body.appendChild(tr);
+  }
+}
+
+function renderAudits(fid) {
+  const body = $("auditsBody");
+  body.innerHTML = "";
+  const rows = state.releases.audits.filter((a) => !fid || a.family_id === fid).slice(0, 50);
+  for (const a of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${a.created_at}</td><td>${auditAction(a.action)}</td>
+      <td>v${a.expected_version ?? "—"} / v${a.observed_version ?? "—"}</td>
+      <td class="${a.result === "allowed" ? "pass" : "fail"}">${a.result === "allowed" ? "允许" : "拒绝"}</td>
+      <td>${a.reason || ""}</td>`;
+    body.appendChild(tr);
+  }
+}
+
+function auditAction(action) {
+  return { publish: "发布", withdraw: "撤回", restore: "恢复", rollback: "回滚" }[action] || action;
+}
+
+function renderGate() {
+  const runs = state.releases ? state.releases.gate_runs : [];
+  let run = runs.find((r) => r.run_id === state.selectedGateId);
+  if (!run && runs.length) run = runs[0];
+  if (!run) {
+    $("gateDetail").hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  $("gateTitle").textContent = `门禁结果：${run.passed ? "全部通过" : "存在失败"}（${shortId(run.run_id)}）`;
+  $("gateReportLink").href = run.report;
+  $("gateChangesImg").src = run.images.changes;
+  $("gateCandidateMask").src = run.images.candidate_mask;
+  $("gateBaselineMask").src = run.images.baseline_mask;
+  $("gateJson").textContent = JSON.stringify(run, null, 2);
+
+  $("gateChecks").innerHTML = run.checks.map((c) => `
+    <div class="check ${c.passed ? "pass" : "fail"}">
+      <b>${c.passed ? "✓" : "✕"} ${c.name}</b>
+      <span>候选 ${c.candidate} / 基线 ${c.baseline} / 上限 ${c.limit}</span>
+      <p>${c.reason}</p>
+    </div>`).join("");
+}
+
+$("releaseFamilySelect").addEventListener("change", () => {
+  $("releaseFamilyName").disabled = Boolean($("releaseFamilySelect").value);
+  renderReleases();
+});
+
+$("createDraftBtn").addEventListener("click", async () => {
+  showReleaseError("");
+  const file = $("releaseProfileFile").files[0];
+  if (!file) return showReleaseError("请选择候选印刷 ICC 配置");
+  const jobId = $("baselineJobSelect").value;
+  if (!jobId) return showReleaseError("请先在上方生成并保存一个代表性任务作为基线");
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("family_id", $("releaseFamilySelect").value);
+  fd.append("family_name", $("releaseFamilyName").value);
+  fd.append("baseline_job_id", jobId);
+  fd.append("max_de_mean", $("limitMean").value);
+  fd.append("max_de_p95", $("limitP95").value);
+  fd.append("max_over_threshold_ratio", $("limitOverRatio").value);
+  fd.append("max_mask_changed_pixels", $("limitChanged").value);
+  const btn = $("createDraftBtn");
+  btn.disabled = true;
+  $("releaseMsg").textContent = "正在上传并固定图像、源/显示配置和参数…";
+  try {
+    const draft = await apiRaw("/api/releases/drafts", { method: "POST", body: fd });
+    $("releaseMsg").textContent = "草稿已保存，开始按 SHA-256 快照重跑…";
+    const run = await apiRaw(`/api/releases/drafts/${draft.draft_id}/gate`, { method: "POST" });
+    state.selectedGateId = run.run_id;
+    await loadReleases();
+    $("releaseMsg").textContent = run.passed ? "门禁全部通过，可以发布。" : "门禁失败，草稿已保留。";
+  } catch (err) {
+    showReleaseError(err.message);
+    $("releaseMsg").textContent = "";
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function runGate(draftId) {
+  showReleaseError("");
+  try {
+    const run = await apiRaw(`/api/releases/drafts/${draftId}/gate`, { method: "POST" });
+    state.selectedGateId = run.run_id;
+    await loadReleases();
+  } catch (err) { showReleaseError(err.message); }
+}
+
+function askExpectedVersion(current) {
+  const value = window.prompt("请输入期望的当前版本号，用于乐观并发控制：", String(current ?? 0));
+  if (value === null) return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+async function publishDraft(draft, current) {
+  const expected = askExpectedVersion(current);
+  if (expected === null) return;
+  try {
+    await apiRaw(`/api/releases/drafts/${draft.draft_id}/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_version: expected }),
+    });
+    await loadReleases();
+  } catch (err) { alert("发布失败：" + err.message); }
+}
+
+async function versionAction(version, action, current) {
+  const expected = askExpectedVersion(current);
+  if (expected === null) return;
+  try {
+    await apiRaw(`/api/releases/versions/${version.version_id}/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_version: expected }),
+    });
+    await loadReleases();
+  } catch (err) { alert(`${action === "withdraw" ? "撤回" : action === "restore" ? "恢复" : "回滚"}失败：` + err.message); }
+}
+
+Promise.all([
+  loadProfiles().catch((e) => showError("加载配置列表失败: " + e.message)),
+  loadReleases().catch((e) => showReleaseError("加载发布模块失败: " + e.message)),
+]);
+
+setInterval(() => loadReleases().catch(() => {}), 15000);
